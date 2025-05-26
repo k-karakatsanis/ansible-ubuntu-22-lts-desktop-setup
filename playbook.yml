@@ -1,0 +1,564 @@
+---
+- name: Configure Ubuntu Development and RE Environment
+  hosts: localhost
+  connection: local
+  become: yes # Overall default for the play
+  vars:
+    # Attempt to get the invoking user and their home directory
+    # This should be the user who typed 'ansible-playbook ...'
+    invoking_user: "{{ lookup('env', 'USER') }}"
+    invoking_user_home: "{{ lookup('env', 'HOME') }}"
+
+    # Use these 'invoking_user' variables for user-specific paths and ownership
+    # Fallback to ansible_user_id if lookup somehow fails, though it shouldn't for USER/HOME
+    username: "{{ invoking_user | default(ansible_user_id) }}"
+    user_home: "{{ invoking_user_home | default('/home/' + username if username != 'root' else '/root') }}" # More robust home path
+
+    pyenv_root: "{{ user_home }}/.pyenv"
+    zsh_custom_plugins_dir: "{{ user_home }}/.config/zsh/plugins"
+
+    python_versions:
+      - "3.12"
+      - "3.11"
+    default_python_version: "3.12"
+
+    install_binwalk: false # Set to true if binwalk installation is desired. Takes a lot of time due to dependencies.
+
+    # Ghidra settings
+    ghidra_version: "11.3.2"
+    ghidra_release_date_for_zip: "20250415" # Release date for Ghidra 11.3.2
+    ghidra_zip_filename: "ghidra_{{ ghidra_version }}_PUBLIC_{{ ghidra_release_date_for_zip }}.zip"
+    ghidra_download_url: "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_{{ ghidra_version }}_build/{{ ghidra_zip_filename }}"
+    ghidra_install_dir_base: "/opt"
+    ghidra_versioned_install_dir: "{{ ghidra_install_dir_base }}/ghidra_{{ ghidra_version }}_PUBLIC"
+    ghidra_symlink: "/usr/local/bin/ghidra"
+
+    vscode_extensions:
+      - "ms-python.python"
+      - "ms-python.vscode-pylance"
+      - "ms-python.black-formatter"
+      - "ms-pyright.pyright"
+      - "charliermarsh.ruff"
+      - "timonwong.shellcheck"
+      - "ms-vscode.hexeditor"
+      - "ms-vscode-remote.remote-ssh"
+      - "ms-vscode-remote.remote-containers"
+      - "ms-azuretools.vscode-containers"
+      - "redhat.vscode-yaml"
+      - "eamodio.gitlens"
+
+  tasks:
+    - name: Debug user and path information (MUST BE FIRST TASK)
+      ansible.builtin.debug:
+        msg:
+          - "Lookup('env', 'USER'): {{ lookup('env', 'USER') }}"
+          - "Lookup('env', 'HOME'): {{ lookup('env', 'HOME') }}"
+          - "Playbook var 'invoking_user': {{ invoking_user }}"
+          - "Playbook var 'invoking_user_home': {{ invoking_user_home }}"
+          - "Playbook var 'username' (final used): {{ username }}"
+          - "Playbook var 'user_home' (final used): {{ user_home }}"
+          - "Playbook var 'zsh_custom_plugins_dir': {{ zsh_custom_plugins_dir }}"
+          - "Ansible fact ansible_user_id: {{ ansible_user_id }}"
+          - "Ansible fact ansible_user_uid: {{ ansible_user_uid }}"
+          - "Ansible fact ansible_env.USER: {{ ansible_env.USER | default('Not set') }}"
+          - "Ansible fact ansible_env.HOME: {{ ansible_env.HOME | default('Not set') }}"
+      run_once: true
+      become: no
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+      changed_when: false
+
+    - name: Install essential build tools, Python build deps, common utils, Zsh extras
+      ansible.builtin.apt:
+        name:
+          - build-essential
+          - libssl-dev
+          - zlib1g-dev
+          - libbz2-dev
+          - libreadline-dev
+          - libsqlite3-dev
+          - wget
+          - curl
+          - llvm
+          - libncurses5-dev
+          - libncursesw5-dev
+          - xz-utils
+          - tk-dev
+          - libffi-dev
+          - liblzma-dev
+          - python3-openssl
+          - git
+          - libedit-dev
+          - pkg-config
+          - tree
+          - jq
+          - htop
+          - hexedit
+          - vim-gtk3
+          - zsh
+          - tmux
+          - fzf
+          - zsh-autosuggestions
+          - zsh-syntax-highlighting
+          - ufw
+        state: present
+
+    # UFW Configuration (Firewall)
+    - name: Set UFW default policies (deny incoming, allow outgoing)
+      community.general.ufw:
+        policy: "{{ item.policy }}"
+        direction: "{{ item.direction }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+      become: yes
+      notify: UFW policy changed
+
+    - name: Enable UFW firewall
+      community.general.ufw:
+        state: enabled
+      become: yes
+      notify: UFW policy changed
+
+    - name: Set Zsh as default shell for the user
+      ansible.builtin.user:
+        name: "{{ username }}"
+        shell: /usr/bin/zsh
+
+    - name: Create Zsh custom plugins directory
+      ansible.builtin.file:
+        path: "{{ zsh_custom_plugins_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ username }}"
+        group: "{{ username }}"
+      become: no
+
+    - name: Install zsh-history-substring-search plugin via Git
+      ansible.builtin.git:
+        repo: 'https://github.com/zsh-users/zsh-history-substring-search.git'
+        dest: "{{ zsh_custom_plugins_dir }}/zsh-history-substring-search"
+        depth: 1
+      become: no
+
+    - name: Clone Powerlevel10k from Git
+      ansible.builtin.git:
+        repo: https://github.com/romkatv/powerlevel10k.git
+        dest: "{{ user_home }}/powerlevel10k"
+        depth: 1
+      become: no
+
+    - name: Create/Update .zshrc for functionality and plugins
+      ansible.builtin.blockinfile:
+        path: "{{ user_home }}/.zshrc"
+        create: yes
+        owner: "{{ username }}"
+        group: "{{ username }}"
+        mode: '0644'
+        marker: "# {mark} ANSIBLE MANAGED ZSH CONFIGURATION"
+        block: |
+          # Basic Zsh configuration
+          HISTFILE={{ user_home }}/.zsh_history
+          HISTSIZE=10000
+          SAVEHIST=10000
+          setopt appendhistory notify nomatch INC_APPEND_HISTORY SHARE_HISTORY \
+                 HIST_IGNORE_DUPS HIST_IGNORE_SPACE HIST_VERIFY HIST_EXPIRE_DUPS_FIRST
+          
+          # Zsh Completion System
+          autoload -U compinit && compinit
+          zstyle ':completion:*' menu select
+          zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' # Case-insensitive completion
+
+          # Source Packaged Zsh Plugins
+          if [ -f /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]; then
+            source /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+          fi
+          if [ -f /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]; then
+            source /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+          fi
+
+          # Source Git-cloned zsh-history-substring-search
+          ZSH_HISTORY_SUBSTRING_SEARCH_DIR="{{ zsh_custom_plugins_dir }}/zsh-history-substring-search"
+          if [ -f "$ZSH_HISTORY_SUBSTRING_SEARCH_DIR/zsh-history-substring-search.zsh" ]; then
+            source "$ZSH_HISTORY_SUBSTRING_SEARCH_DIR/zsh-history-substring-search.zsh"
+            bindkey "$terminfo[kcuu1]" history-substring-search-up
+            bindkey "$terminfo[kcud1]" history-substring-search-down
+          fi
+
+          # Source FZF keybindings (if fzf package installs them here)
+          [ -f /usr/share/doc/fzf/examples/key-bindings.zsh ] && source /usr/share/doc/fzf/examples/key-bindings.zsh
+          [ -f /usr/share/doc/fzf/examples/completion.zsh ] && source /usr/share/doc/fzf/examples/completion.zsh
+
+          # Source Powerlevel10k theme
+          # Run 'p10k configure' in a new Zsh session to customize the prompt.
+          if [ -f "{{ user_home }}/powerlevel10k/powerlevel10k.zsh-theme" ]; then
+            source "{{ user_home }}/powerlevel10k/powerlevel10k.zsh-theme"
+          fi
+
+          # Pyenv initialization
+          export PYENV_ROOT="{{ pyenv_root }}"
+          export PATH="$PYENV_ROOT/bin:$PATH"
+          if command -v pyenv 1>/dev/null 2>&1; then
+            eval "$(pyenv init --path)"
+            eval "$(pyenv init -)"
+            eval "$(pyenv virtualenv-init -)"
+          fi
+
+          # Common Git Aliases
+          alias g='git'
+          alias ga='git add'
+          alias gaa='git add --all'
+          alias gc='git commit -v'
+          alias gc!='git commit -v --amend'
+          alias gca='git commit -v -a'
+          alias gca!='git commit -v -a --amend'
+          alias gco='git checkout'
+          alias gcm='git checkout main'
+          alias gd='git diff'
+          alias gds='git diff --staged'
+          alias gf='git fetch'
+          alias gl='git pull'
+          alias gp='git push'
+          alias gpf!='git push --force-with-lease'
+          alias gs='git status -sb'
+          alias glog="git log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit"
+
+          # Common ls Aliases
+          alias l='ls -CF'
+          alias la='ls -A'
+          alias ll='ls -alhF'
+          alias ls='ls --color=auto'
+      become: no
+
+    - name: Create enhanced .vimrc
+      ansible.builtin.copy:
+        dest: "{{ user_home }}/.vimrc"
+        owner: "{{ username }}"
+        group: "{{ username }}"
+        mode: '0644'
+        content: |
+          " Enhanced Vim Configuration (Ansible Managed)
+          syntax on
+          set encoding=utf-8
+          set number
+          set relativenumber
+          set tabstop=4
+          set shiftwidth=4
+          set expandtab
+          set smartindent
+          set autoindent
+          set wrap
+          set mouse=a
+          set showcmd
+          set wildmenu
+          set wildmode=longest:full,full
+          set scrolloff=8
+          set ignorecase
+          set smartcase
+          set incsearch
+          set hlsearch
+          set showmatch
+          filetype plugin indent on
+
+          if has("persistent_undo")
+            set undofile
+            set undodir={{ user_home }}/.vim/undodir
+            if !isdirectory(&undodir)
+              call mkdir(&undodir, "p", 0700)
+            endif
+          endif
+
+          set background=dark
+          colorscheme desert
+        force: yes # Overwrite .vimrc with this configuration
+      become: no
+
+    - name: Create Vim undo directory
+      ansible.builtin.file:
+        path: "{{ user_home }}/.vim/undodir"
+        state: directory
+        mode: '0700'
+        owner: "{{ username }}"
+        group: "{{ username }}"
+      become: no
+
+    # Docker CE Installation
+    - name: Install prerequisites for Docker repository
+      ansible.builtin.apt:
+        name: [ca-certificates, gnupg]
+        state: present
+
+    - name: Create directory for Docker GPG key
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker's official GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /etc/apt/keyrings/docker.gpg
+        state: present
+
+    - name: Set up Docker stable repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture if ansible_architecture == 'aarch64' else 'amd64' }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker CE
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Add user to the docker group
+      ansible.builtin.user:
+        name: "{{ username }}"
+        groups: docker
+        append: yes
+      notify: Docker group info
+
+    - name: Ensure Docker service is started and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # VS Code Installation
+    - name: Add Microsoft GPG key for VS Code
+      ansible.builtin.apt_key:
+        url: https://packages.microsoft.com/keys/microsoft.asc
+        state: present
+
+    - name: Add VS Code repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64] https://packages.microsoft.com/repos/vscode stable main"
+        state: present
+        filename: vscode
+
+    - name: Install VS Code
+      ansible.builtin.apt:
+        name: code
+        state: present
+        update_cache: yes
+
+    - name: Install VS Code extensions for the user
+      ansible.builtin.command: "code --install-extension {{ item }} --force"
+      loop: "{{ vscode_extensions }}"
+      become: no
+      register: extension_install_result_user
+      changed_when: "'is already installed.' not in extension_install_result_user.stdout and 'already installed' not in extension_install_result_user.stderr and 'successfully installed' in extension_install_result_user.stdout"
+      failed_when: "extension_install_result_user.rc != 0 and 'is already installed.' not in extension_install_result_user.stdout and 'already installed' not in extension_install_result_user.stderr"
+
+    # Pyenv and Python versions
+    - name: Clone pyenv
+      ansible.builtin.git:
+        repo: 'https://github.com/pyenv/pyenv.git'
+        dest: "{{ pyenv_root }}"
+        version: master
+      become: no
+      tags: pyenv
+
+    - name: Clone pyenv-virtualenv (pyenv plugin)
+      ansible.builtin.git:
+        repo: 'https://github.com/pyenv/pyenv-virtualenv.git'
+        dest: "{{ pyenv_root }}/plugins/pyenv-virtualenv"
+        version: master
+      become: no
+      tags: pyenv
+
+    - name: Install specified Python versions with pyenv
+      ansible.builtin.shell: |
+        set -e
+        export PYENV_ROOT="{{ pyenv_root }}"
+        export PATH="$PYENV_ROOT/bin:$PATH"
+        if command -v pyenv 1>/dev/null 2>&1; then
+          eval "$(pyenv init --path)"
+          eval "$(pyenv init -)"
+        else
+          echo "pyenv command not found in shell task for user {{ username }}"
+          exit 1
+        fi
+        if ! pyenv versions --bare | grep -q "^{{ item }}\."; then
+          echo "Installing Python {{ item }} via pyenv..."
+          pyenv install {{ item }}
+        else
+          echo "Python {{ item }}.x already has a version installed, skipping install for {{ item }}."
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ python_versions }}"
+      become: no
+      environment:
+        PYENV_ROOT: "{{ pyenv_root }}"
+        PATH: "{{ pyenv_root }}/bin:{{ ansible_env.PATH }}"
+      register: pyenv_install_result
+      changed_when: "'Installing Python-' in pyenv_install_result.stdout or 'Installed Python-' in pyenv_install_result.stdout"
+      tags: pyenv
+
+    - name: Set global Python version with pyenv
+      ansible.builtin.shell: |
+        set -e
+        export PYENV_ROOT="{{ pyenv_root }}"
+        export PATH="$PYENV_ROOT/bin:$PATH"
+        eval "$(pyenv init --path)"
+        eval "$(pyenv init -)"
+        LATEST_PATCH_FOR_DEFAULT=$(pyenv versions --bare | grep "^{{ default_python_version }}\." | sort -V | tail -n 1)
+        if [ -n "$LATEST_PATCH_FOR_DEFAULT" ]; then
+          pyenv global "$LATEST_PATCH_FOR_DEFAULT"
+        else
+          echo "Warning: No installed version found for default Python {{ default_python_version }}. Global not set."
+        fi
+      args:
+        executable: /bin/bash
+      become: no
+      environment:
+        PYENV_ROOT: "{{ pyenv_root }}"
+        PATH: "{{ pyenv_root }}/bin:{{ ansible_env.PATH }}"
+      changed_when: true
+      when: python_versions | length > 0
+      tags: pyenv
+
+    # IDA Pro 7 dependencies
+    - name: Enable i386 architecture
+      ansible.builtin.command: dpkg --add-architecture i386
+      changed_when: false
+      notify: Run apt update after adding i386
+      when: "'i386' not in (ansible_facts.dpkg_architectures | default([]))"
+
+    - name: Install IDA Pro 7 dependencies (i386 and amd64)
+      ansible.builtin.apt:
+        name:
+          - libc6:i386
+          - libexpat1:i386
+          - libfontconfig1:i386
+          - libfreetype6:i386
+          - libgcc-s1:i386
+          - libglib2.0-0:i386
+          - libice6:i386
+          - libpcre3:i386
+          - libsm6:i386
+          - libstdc++6:i386
+          - libuuid1:i386
+          - libx11-6:i386
+          - libxau6:i386
+          - libxcb1:i386
+          - libxdmcp6:i386
+          - libxext6:i386
+          - libxrender1:i386
+          - zlib1g:i386
+          - libx11-xcb1:i386
+          - libdbus-1-3:i386
+          - libxi6:i386
+          - libcurl4:i386
+          - libcurl4 # 64-bit
+          - libcanberra-gtk-module
+          - libcanberra-gtk3-module
+          - libcanberra-gtk-module:i386
+          - libcanberra-gtk3-module:i386
+        state: present
+      register: ida_deps_install
+      until: ida_deps_install is succeeded
+      retries: 3
+      delay: 10
+
+    # Binwalk Installation
+    - name: Install binwalk (if enabled)
+      ansible.builtin.apt:
+        name: binwalk
+        state: present
+      when: install_binwalk # This task only runs if install_binwalk is true
+
+    # Ghidra Installation
+    - name: Install OpenJDK (Ghidra dependency)
+      ansible.builtin.apt:
+        name: openjdk-21-jdk
+        state: present
+      tags: ghidra
+
+    - name: Download Ghidra
+      ansible.builtin.get_url:
+        url: "{{ ghidra_download_url }}"
+        dest: "/tmp/{{ ghidra_zip_filename }}"
+        mode: '0644'
+        timeout: 600
+      register: ghidra_download
+      until: ghidra_download is succeeded
+      retries: 3
+      delay: 15
+      tags: ghidra
+
+    - name: Unarchive Ghidra
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ ghidra_zip_filename }}"
+        dest: "{{ ghidra_install_dir_base }}"
+        remote_src: yes
+        creates: "{{ ghidra_versioned_install_dir }}/ghidraRun"
+      tags: ghidra
+
+    - name: Create symlink for ghidraRun
+      ansible.builtin.file:
+        src: "{{ ghidra_versioned_install_dir }}/ghidraRun"
+        dest: "{{ ghidra_symlink }}"
+        state: link
+        force: yes
+      tags: ghidra
+
+    - name: Clean up downloaded Ghidra zip
+      ansible.builtin.file:
+        path: "/tmp/{{ ghidra_zip_filename }}"
+        state: absent
+      tags: ghidra
+
+    # Broadcom Wi-Fi driver
+    - name: Install Broadcom STA/WL Wi-Fi driver
+      ansible.builtin.apt:
+        name: bcmwl-kernel-source
+        state: present
+      notify: WiFi driver installation note
+
+    - name: Autoremove unused packages
+      ansible.builtin.apt:
+        autoremove: yes
+
+  handlers:
+    - name: Docker group info
+      ansible.builtin.debug:
+        msg: "User {{ username }} has been added to the docker group. You will need to LOG OUT and LOG BACK IN for this change to take effect."
+    - name: Run apt update after adding i386
+      ansible.builtin.apt:
+        update_cache: yes
+      changed_when: false # This is just a refresh, not a state change we care about for handler logic.
+    - name: UFW policy changed
+      ansible.builtin.debug:
+        msg: "UFW configuration has been updated. Firewall is active (or policy set)."
+    - name: WiFi driver installation note
+      ansible.builtin.debug:
+        msg:
+          - "Broadcom Wi-Fi driver (bcmwl-kernel-source) has been installed."
+          - "A reboot might be necessary for the Wi-Fi to become fully active."
+          - "After rebooting, check Network Manager for available Wi-Fi networks."
+
+  post_tasks:
+    - name: Final instructions
+      ansible.builtin.debug:
+        msg:
+          - "Ansible playbook execution finished."
+          - "IMPORTANT: For Zsh to become the default shell, for pyenv PATH changes, Zsh plugin sourcing, Docker group membership, and VS Code extensions to be fully available, please LOG OUT and LOG BACK IN to the Ubuntu session."
+          - "After logging back in, verify:"
+          - "  - Zsh is the selected shell: echo $SHELL"
+          - "  - Zsh features: Try typing a command (suggestions?), check history (Ctrl+R with fzf, or Up/Down with history-substring-search)."
+          - "  - Python versions: pyenv versions (and 'python --version' to see global)"
+          - "  - Docker: docker run hello-world (should run without sudo)"
+          - "  - Ghidra: type 'ghidra' in terminal or run '{{ ghidra_versioned_install_dir }}/ghidraRun'"
+          - "  - VS Code: Launch and check if extensions (Python, Black, Pyright, Ruff, Bash IDE, HexEditor etc.) are active."
+          - "  - Vim: Check new settings like line numbers, mouse support."
+          - "Consider further customizing .zshrc and .vimrc. If Powerlevel10k is wanted (and its package is installed), uncomment its source line in .zshrc and typically run 'p10k configure' in a new Zsh session."
