@@ -23,6 +23,7 @@
     default_python_version: "3.12"
 
     install_binwalk: false # Set to true if binwalk installation is desired. Takes a lot of time due to dependencies.
+    install_broadcom_wifi_driver: true # Default to false to keep it optional. Set to true if you need the bcmwl-kernel-source driver
 
     # Ghidra settings
     ghidra_version: "11.3.2"
@@ -519,10 +520,11 @@
       tags: ghidra
 
     # Broadcom Wi-Fi driver
-    - name: Install Broadcom STA/WL Wi-Fi driver
+    - name: Install Broadcom STA/WL Wi-Fi driver (if enabled)
       ansible.builtin.apt:
         name: bcmwl-kernel-source
         state: present
+      when: install_broadcom_wifi_driver # Only runs if the variable is true
       notify: WiFi driver installation note
 
     - name: Autoremove unused packages
